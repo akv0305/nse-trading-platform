@@ -13,9 +13,9 @@ pydantic-settings>=2.6.0
 # ── Broker API ────────────────────────────────────────────────────────────
 fyers-apiv3>=3.1.0
 
-# ── Data & Computation ────────────────────────────────────────────────────
-pandas>=2.2.0
-numpy>=1.26.0
+# ── Data & Computation (pinned for Python 3.11 + IDX compatibility) ───────
+numpy>=1.26.0,<2.0.0
+pandas>=2.2.0,<2.3.0
 
 # ── Dashboard ─────────────────────────────────────────────────────────────
 streamlit>=1.40.0
@@ -30,17 +30,18 @@ python-dotenv>=1.0.0
 # ── Serialization ─────────────────────────────────────────────────────────
 orjson>=3.10.0
 
-# ── Technical Analysis (used by indicators & strategies) ──────────────────
-ta-lib>=0.5.1; platform_system != "Windows"
-# On Windows, install TA-Lib from wheel: https://github.com/cgohlke/talib-build
-pandas-ta>=0.3.14b1
+# ── Technical Analysis ────────────────────────────────────────────────────
+# pandas-ta has compatibility issues; we use manual indicator implementations
+# in core/indicators/ instead. TA-Lib C library optional — install separately
+# if available on your system:
+#   sudo apt-get install -y ta-lib && pip install ta-lib
 
 # ── Statistics (backtesting, strategy evaluation) ─────────────────────────
 statsmodels>=0.14.0
 scipy>=1.14.0
 
 # ── LLM Integration (Phase 4 — install when needed) ──────────────────────
-anthropic>=0.39.0
+# anthropic>=0.39.0
 
 # ── Testing ───────────────────────────────────────────────────────────────
 pytest>=8.3.0
