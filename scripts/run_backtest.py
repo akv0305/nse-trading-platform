@@ -170,17 +170,53 @@ def _print_results(result) -> None:
 
     # Top 5 best & worst trades
     if result.trades:
-        sorted_trades = sorted(result.trades, key=lambda t: t.get("net_pnl", 0), reverse=True)
+        sorted_trades = sorted(
+            result.trades, key=lambda t: t.get("pnl_net", 0), reverse=True
+        )
         print("\n  Top 5 Winners:")
         for t in sorted_trades[:5]:
-            print(f"    {t.get('symbol', '?'):>20s}  ₹{t.get('net_pnl', 0):>+10,.2f}  "
+            print(f"    {t.get('symbol', '?'):>20s}  ₹{t.get('pnl_net', 0):>+10,.2f}  "
                   f"({t.get('exit_reason', '')})")
         print("\n  Top 5 Losers:")
         for t in sorted_trades[-5:]:
-            print(f"    {t.get('symbol', '?'):>20s}  ₹{t.get('net_pnl', 0):>+10,.2f}  "
+            print(f"    {t.get('symbol', '?'):>20s}  ₹{t.get('pnl_net', 0):>+10,.2f}  "
                   f"({t.get('exit_reason', '')})")
         print()
 
+    # ── Trade diagnostics ──────────────────────────────────────────
+    if result.trades:
+        pnls = [t.get("pnl_net", 0) for t in result.trades]
+        quantities = [t.get("quantity", 0) for t in result.trades]
+        costs = [t.get("costs_total", 0) for t in result.trades]
+        winners = [p for p in pnls if p > 0]
+        losers = [p for p in pnls if p < 0]
+
+        print("  ── Diagnostics ──")
+        print(f"  Avg winner     : ₹{sum(winners)/len(winners):>10,.2f}" if winners else "  Avg winner     : N/A")
+        print(f"  Avg loser      : ₹{sum(losers)/len(losers):>10,.2f}" if losers else "  Avg loser      : N/A")
+        print(f"  Avg quantity   : {sum(quantities)/len(quantities):>8,.0f} shares")
+        print(f"  Total costs    : ₹{sum(costs):>10,.2f}")
+        print(f"  Avg cost/trade : ₹{sum(costs)/len(costs):>8,.2f}")
+        print(f"  FLATTEN exits  : {sum(1 for t in result.trades if t.get('exit_reason')=='FLATTEN')}")
+        print(f"  STOPLOSS exits : {sum(1 for t in result.trades if t.get('exit_reason')=='STOPLOSS')}")
+        print(f"  TARGET exits   : {sum(1 for t in result.trades if t.get('exit_reason')=='TARGET')}")
+        print(f"  TRAIL exits    : {sum(1 for t in result.trades if t.get('exit_reason')=='TRAIL')}")
+        print()
+
+    # Breakdown by exit reason
+    from collections import defaultdict
+    reason_stats = defaultdict(lambda: {"count": 0, "total_pnl": 0.0})
+    for t in result.trades:
+        r = t.get("exit_reason", "UNKNOWN")
+        reason_stats[r]["count"] += 1
+        reason_stats[r]["total_pnl"] += t.get("pnl_net", 0)
+    
+    print("\n  ── P&L by Exit Reason ──")
+    for reason, stats in sorted(reason_stats.items()):
+        avg = stats["total_pnl"] / stats["count"] if stats["count"] else 0
+        print(f"  {reason:12s}: {stats['count']:4d} trades, "
+              f"total ₹{stats['total_pnl']:>+12,.2f}, "
+              f"avg ₹{avg:>+8,.2f}")
 
 # ── Main ──────────────────────────────────────────────────────────────────
 

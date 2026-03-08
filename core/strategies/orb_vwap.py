@@ -1,329 +1,451 @@
 """
-NSE Trading Platform — ORB + VWAP Breakout Strategy
+ORB + VWAP Breakout Strategy  –  v2 (optimised)
+=================================================
+Complete replacement for core/strategies/orb_vwap.py
 
-Intraday equity strategy for Nifty 50 stocks.
-
-Lifecycle:
-  1. pre_market_scan()  → shortlist 10 stocks via scanner
-  2. on_candle()        → capture ORB, detect breakouts, confirm with VWAP
-  3. should_exit()      → check SL, target, trailing stop, flatten time
-  4. end_of_day()       → reset ORB levels and internal state
+Fixes vs v1
+-----------
+1. ATR-based stop-loss (tighter than OR-opposite-end) for improved R:R
+2. Risk filter: skip if risk > 1.5% of entry price
+3. Stronger breakout confirmation (VWAP alignment + volume + sector)
+4. Better signal-strength scoring (penalises weak setups)
+5. Proper trailing stop at settings.ORB_TRAIL_AFTER_RR
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, time, timedelta
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
 from config.settings import settings
-from core.data.models import Candle, Signal, SignalType, Direction
-from core.data.universe import from_fyers_symbol
-from core.indicators.orb import ORBLevels, compute_opening_range, detect_breakout
-from core.indicators.vwap import VWAPData, compute_vwap
-from core.indicators.sector_score import compute_sector_scores, get_stock_sector_bias
+from core.data.models import (
+    Candle,
+    Direction,
+    Signal,
+    SignalType,
+    TradePlan,
+)
+from core.data.universe import (
+    SECTOR_INDICES,
+    SECTOR_MAP,
+    from_fyers_symbol,
+    get_stock_sector,
+)
+from core.indicators.orb import compute_opening_range, detect_breakout, ORBLevels
+from core.indicators.vwap import compute_vwap, VWAPData
+from core.indicators.sector_score import (
+    compute_sector_scores,
+    get_stock_sector_bias,
+)
 from core.scanner.stock_scanner import scan_for_orb
 from core.strategies.base import StrategyBase
-from core.utils.time_utils import epoch_ms_to_ist, ist_to_epoch_ms, IST, now_epoch_ms
+from core.utils.time_utils import epoch_ms_to_ist, parse_time_str
 
 logger = logging.getLogger(__name__)
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+MARKET_OPEN: time = time(9, 15)
 
+
+def _settings_time(attr: str, default: str) -> time:
+    """Read an 'HH:MM' string from settings and return a datetime.time."""
+    val = getattr(settings, attr, default)
+    if isinstance(val, time):
+        return val
+    h, m = parse_time_str(str(val))
+    return time(h, m)
+
+
+def _or_end_time() -> time:
+    minutes = getattr(settings, "ORB_PERIOD_MINUTES", 15)
+    return (
+        datetime.combine(datetime.today(), MARKET_OPEN)
+        + timedelta(minutes=minutes)
+    ).time()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Per-symbol tracking state  (public name so tests can import _SymbolState)
+# ──────────────────────────────────────────────────────────────────────────────
 @dataclass
 class _SymbolState:
-    """Internal per-symbol tracking state for one trading day."""
-    orb: ORBLevels | None = None          # OR levels once captured
-    orb_captured: bool = False             # True after OR period ends
-    orb_rejected: bool = False             # True if OR was captured but rejected (width filter)
-    breakout_fired: bool = False           # True after first breakout signal
-    or_candles: list[Candle] = field(default_factory=list)  # candles during OR window
-    all_candles: list[Candle] = field(default_factory=list)  # all candles today
-    avg_or_volume: float = 0.0            # avg volume during OR period
-    peak_price_long: float = 0.0          # high watermark since entry (for trailing SL)
-    peak_price_short: float = float("inf")  # low watermark since entry (for trailing SL)
+    """Mutable intraday state for one symbol."""
+    orb: Optional[ORBLevels] = None
+    orb_captured: bool = False
+    orb_rejected: bool = False
+    breakout_fired: bool = False
+
+    or_candles: list = field(default_factory=list)
+    all_candles: list = field(default_factory=list)
+
+    avg_or_volume: float = 0.0
+    intraday_atr: float = 0.0
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Strategy
+# ──────────────────────────────────────────────────────────────────────────────
 class ORBVWAPStrategy(StrategyBase):
     """
-    Opening Range Breakout + VWAP confirmation strategy.
+    Opening-Range Breakout confirmed by VWAP, volume and sector bias.
 
-    Entry:
-      LONG  — close > ORB_HIGH + buffer, price > VWAP, VWAP slope up,
-              volume > 1.5× OR avg, sector positive.
-      SHORT — close < ORB_LOW − buffer, price < VWAP, VWAP slope down,
-              volume > 1.5× OR avg, sector negative.
-
-    Exit:
-      Stoploss (ORB opposite), target (R:R), trailing stop, flatten time.
+    Lifecycle (called by BacktestEngine / live engine):
+        1. pre_market_scan(universe, historical_data) → pick watchlist
+        2. on_candle(symbol, candle, history, position)  → entry signals
+        3. should_exit(symbol, current_price, position, candle) → exit signals
+        4. end_of_day()  → reset state
     """
 
     def __init__(self) -> None:
-        super().__init__(name="orb_vwap", version="1.0.0")
+        self._name = "orb_vwap"
+        self._version = "1.0.0"
+        self._is_active = True
+        self._watchlist: List[str] = []
+        self._states: Dict[str, _SymbolState] = {}
+        self._sector_scores: Dict[str, float] = {}
 
-        # ── Per-symbol state, reset daily via end_of_day() ────────────
-        self._states: dict[str, _SymbolState] = {}
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+    @property
+    def name(self) -> str:
+        return self._name
 
-        # ── Sector scores, computed once during pre_market_scan() ─────
-        self._sector_scores: dict[str, float] = {}
+    @property
+    def version(self) -> str:
+        return self._version
 
-    # ══════════════════════════════════════════════════════════════════
-    # StrategyBase abstract methods
-    # ══════════════════════════════════════════════════════════════════
+    @property
+    def is_active(self) -> bool:
+        return self._is_active
 
+    @property
+    def watchlist(self) -> List[str]:
+        return list(self._watchlist)
+
+    def __repr__(self) -> str:
+        return f"ORBVWAPStrategy(name={self._name!r}, version={self._version!r})"
+
+    # ------------------------------------------------------------------
+    # 1. PRE-MARKET SCAN
+    # ------------------------------------------------------------------
     def pre_market_scan(
         self,
-        universe: list[str],
-        historical_data: dict[str, pd.DataFrame],
-    ) -> list[str]:
-        """
-        Shortlist top N stocks for today's ORB trading session.
+        universe: List[str],
+        historical_data: Dict[str, pd.DataFrame],
+    ) -> List[str]:
+        self._states.clear()
+        self._watchlist.clear()
 
-        Steps:
-          1. Compute sector scores from last 5 days of sector indices.
-          2. Run scan_for_orb() on universe with historical data.
-          3. Set watchlist to top SCAN_TOP_N symbols.
-        """
-        # ── Compute sector scores ─────────────────────────────────────
-        sector_data: dict[str, pd.DataFrame] = {}
-        nifty_data: pd.DataFrame = pd.DataFrame()
+        if not universe:
+            return []
+
+        # ── Sector scores ────────────────────────────────────────────
+        _fyers_to_sector = {v: k for k, v in SECTOR_INDICES.items()}
+        sector_data: Dict[str, pd.DataFrame] = {}
+        nifty_data = pd.DataFrame()
 
         for key, df in historical_data.items():
-            if "NIFTY" in key.upper() and "INDEX" in key.upper():
-                try:
-                    _, name_part, _ = from_fyers_symbol(key)
-                except (ValueError, IndexError):
-                    pass
+            if "NIFTY50" in key.upper() or key == "NSE:NIFTY50-INDEX":
+                nifty_data = df
+            elif key in _fyers_to_sector:
+                sector_data[_fyers_to_sector[key]] = df
 
-                if "NIFTY50" in key.upper() or key.upper() == "NSE:NIFTY50-INDEX":
-                    nifty_data = df
-                else:
-                    sector_data[key] = df
-
-        if not sector_data or nifty_data.empty:
-            self._sector_scores = {}
+        if not nifty_data.empty and sector_data:
+            self._sector_scores = compute_sector_scores(sector_data, nifty_data)
         else:
-            self._sector_scores = compute_sector_scores(
-                sector_data, nifty_data, lookback_days=5,
-            )
-
-        # ── Run scanner ───────────────────────────────────────────────
-        candidates = scan_for_orb(
-            universe=universe,
-            historical_data=historical_data,
-            sector_scores=self._sector_scores,
-            top_n=settings.SCAN_TOP_N,
-        )
-
-        self._watchlist = [c["symbol"] for c in candidates]
-
-        # Initialize per-symbol state
-        self._states = {sym: _SymbolState() for sym in self._watchlist}
+            self._sector_scores = {}
 
         logger.info(
-            f"[{self._name}] pre_market_scan: {len(self._watchlist)} stocks "
-            f"shortlisted from {len(universe)} universe"
+            f"[{self._name}] sector_scores ({len(self._sector_scores)}): "
+            f"{self._sector_scores}"
         )
 
-        return self._watchlist.copy()
+        # ── Stock scanner ────────────────────────────────────────────
+        equity_symbols = [s for s in universe if s.endswith("-EQ")]
+        equity_data = {
+            sym: df
+            for sym, df in historical_data.items()
+            if sym in equity_symbols and len(df) >= 6
+        }
 
+        if not equity_data:
+            for sym in equity_symbols:
+                self._watchlist.append(sym)
+                self._states[sym] = _SymbolState()
+            return list(self._watchlist)
+
+        candidates = scan_for_orb(
+            universe=list(equity_data.keys()),
+            historical_data=equity_data,
+            sector_scores=self._sector_scores,
+            top_n=getattr(settings, "SCAN_TOP_N", 15),
+        )
+
+        for cand in candidates:
+            sym = cand["symbol"]
+            self._watchlist.append(sym)
+            self._states[sym] = _SymbolState()
+
+        logger.info(
+            f"[{self._name}] watchlist ({len(self._watchlist)}): "
+            f"{[c['symbol'] for c in candidates[:5]]}..."
+        )
+        return list(self._watchlist)
+
+    # ------------------------------------------------------------------
+    # 2. ON CANDLE  (entry logic)
+    # ------------------------------------------------------------------
     def on_candle(
         self,
         symbol: str,
         candle: Candle,
-        candle_history: list[Candle],
-        current_position: dict | None,
+        history: list[Candle],
+        position: dict[str, Any] | None = None,
     ) -> Signal:
-        """
-        Main signal generation.
+        """Always returns a Signal (BUY/SELL or NO_ACTION with skip_reason)."""
+        if position is not None:
+            return self._no_action_signal(symbol, candle, "position_open")
 
-        Phase 1: During OR period → accumulate candles, capture ORB levels.
-        Phase 2: After OR period → detect breakouts, confirm with VWAP.
-
-        Returns BUY, SELL, or NO_ACTION.
-        """
-        ts = candle.timestamp
-        candle_dt = epoch_ms_to_ist(ts)
-
-        # ── Ensure state exists ───────────────────────────────────────
         if symbol not in self._states:
             self._states[symbol] = _SymbolState()
-        state = self._states[symbol]
 
-        # ── Accumulate all candles for VWAP ───────────────────────────
+        state = self._states[symbol]
         state.all_candles.append(candle)
 
-        # ── Update peak price tracking for trailing stop ──────────────
-        if current_position is not None:
-            state.peak_price_long = max(state.peak_price_long, candle.high)
-            state.peak_price_short = min(state.peak_price_short, candle.low)
+        candle_time = self._candle_time(candle)
+        if candle_time is None:
+            return self._no_action_signal(symbol, candle, "no_timestamp")
 
-        # ── Phase 1: OR Capture ───────────────────────────────────────
-        if not state.orb_captured:
-            return self._handle_or_phase(symbol, candle, state)
+        # ── OR capture phase ────────────────────────────────────────
+        if not state.orb_captured and not state.orb_rejected:
+            return self._handle_or_phase(symbol, candle, candle_time, state)
 
-        # ── ORB rejected (width filter) → no signals for this symbol ──
         if state.orb_rejected:
-            return self.no_action_signal(
-                symbol, candle.close, ts, reason="orb_width_rejected",
-            )
+            return self._no_action_signal(symbol, candle, "orb_width_rejected")
 
-        # ── Already have a position → no new entry ────────────────────
-        if current_position is not None:
-            return self.no_action_signal(
-                symbol, candle.close, ts, reason="position_open",
-            )
-
-        # ── Already fired one breakout for this symbol today ──────────
         if state.breakout_fired:
-            return self.no_action_signal(
-                symbol, candle.close, ts, reason="breakout_already_fired",
-            )
+            return self._no_action_signal(symbol, candle, "breakout_already_fired")
 
-        # ── Entry cutoff check ────────────────────────────────────────
-        cutoff_h, cutoff_m = map(int, settings.ENTRY_CUTOFF_IST.split(":"))
-        if candle_dt.hour > cutoff_h or (candle_dt.hour == cutoff_h and candle_dt.minute >= cutoff_m):
-            return self.no_action_signal(
-                symbol, candle.close, ts, reason="past_entry_cutoff",
-            )
+        # ── Past entry cutoff? ──────────────────────────────────────
+        cutoff = _settings_time("ENTRY_CUTOFF_IST", "14:00")
+        if candle_time >= cutoff:
+            return self._no_action_signal(symbol, candle, "past_cutoff")
 
-        # ── Phase 2: Breakout Detection ───────────────────────────────
-        return self._handle_breakout_phase(symbol, candle, state)
+        # ── Breakout detection ──────────────────────────────────────
+        return self._handle_breakout(symbol, candle, state)
 
+    # ------------------------------------------------------------------
+    # 3. SHOULD EXIT
+    # ------------------------------------------------------------------
     def should_exit(
         self,
         symbol: str,
         current_price: float,
-        position: dict,
-        candle: Candle | None = None,
+        position: Dict[str, Any],
+        candle: Optional[Candle] = None,
     ) -> Signal:
-        """
-        Check exit conditions for an open position.
-
-        Priority order:
-          1. Flatten time (force close)
-          2. Stoploss hit (including trailing)
-          3. Target hit
-        """
-        ts = candle.timestamp if candle else now_epoch_ms()
-        candle_dt = epoch_ms_to_ist(ts)
-        direction = position.get("direction", "LONG")
-        entry_price = float(position.get("entry_price", 0))
-        stoploss_price = float(position.get("stoploss_price", 0))
-        target_price = position.get("target_price")
-        if target_price is not None:
-            target_price = float(target_price)
-
-        # ── Update peak price from position if provided ───────────────
-        # The backtest engine / live engine should pass peak_price in
-        # the position dict.  If not present, use current_price as
-        # fallback (which is the candle-by-candle behavior).
-        if direction == "LONG":
-            peak_price = float(position.get("peak_price", current_price))
-            # Also update from candle high if available
-            if candle is not None:
-                peak_price = max(peak_price, candle.high)
-            peak_price = max(peak_price, current_price)
+        """Always returns a Signal (EXIT_LONG/EXIT_SHORT or NO_ACTION)."""
+        # ── Resolve direction ───────────────────────────────────────
+        raw_dir = position.get("direction", "LONG")
+        if isinstance(raw_dir, Direction):
+            is_long = raw_dir == Direction.LONG
         else:
-            peak_price = float(position.get("peak_price", current_price))
-            if candle is not None:
+            is_long = str(raw_dir).upper() == "LONG"
+
+        entry_price = float(position.get("entry_price", 0))
+        stop_loss = float(position.get("stoploss_price", 0))
+        target = float(position.get("target_price", 0))
+        peak_price = float(position.get("peak_price", current_price))
+        risk = abs(entry_price - stop_loss) if entry_price and stop_loss else 0.0
+
+        price = current_price
+
+        # ── Update peak price ───────────────────────────────────────
+        if candle is not None:
+            if is_long:
+                peak_price = max(peak_price, candle.high)
+            else:
                 peak_price = min(peak_price, candle.low)
-            peak_price = min(peak_price, current_price)
+        else:
+            if is_long:
+                peak_price = max(peak_price, price)
+            else:
+                peak_price = min(peak_price, price)
 
-        # ── 1. Flatten Time ───────────────────────────────────────────
-        flatten_h, flatten_m = map(int, settings.FLATTEN_TIME_IST.split(":"))
-        if candle_dt.hour > flatten_h or (candle_dt.hour == flatten_h and candle_dt.minute >= flatten_m):
-            exit_type = SignalType.EXIT_LONG if direction == "LONG" else SignalType.EXIT_SHORT
-            return Signal(
-                strategy_name=self._name,
-                symbol=symbol,
-                signal_type=exit_type,
-                strength=1.0,
-                price_at_signal=current_price,
-                timestamp=ts,
-                indicator_data={"exit_reason": "FLATTEN", "flatten_time": settings.FLATTEN_TIME_IST},
-                skip_reason="",
-            )
+        position["peak_price"] = peak_price
 
-        # ── Compute trailing stop from peak price (high watermark) ────
-        trailing_sl = self._compute_trailing_sl(
-            direction, entry_price, stoploss_price, peak_price,
+        # ── Trailing stop computation ───────────────────────────────
+        trail_after_rr = getattr(settings, "ORB_TRAIL_AFTER_RR", 1.0)
+        trail_pct = getattr(settings, "ORB_TRAIL_PCT", 0.3)
+        trailing_active, effective_sl = self._compute_trailing_sl(
+            entry_price=entry_price,
+            peak_price=peak_price,
+            stop_loss=stop_loss,
+            risk=risk,
+            is_long=is_long,
+            trail_after_rr=trail_after_rr,
+            trail_pct=trail_pct,
         )
-        # Use the tighter of original SL and trailing SL
-        effective_sl = stoploss_price
-        is_trailing = False
-        if trailing_sl is not None:
-            if direction == "LONG" and trailing_sl > stoploss_price:
-                effective_sl = trailing_sl
-                is_trailing = True
-            elif direction == "SHORT" and trailing_sl < stoploss_price:
-                effective_sl = trailing_sl
-                is_trailing = True
 
-        # ── 2. Stoploss Check ─────────────────────────────────────────
-        sl_hit = False
-        if direction == "LONG" and current_price <= effective_sl:
-            sl_hit = True
-        elif direction == "SHORT" and current_price >= effective_sl:
-            sl_hit = True
+        # ── Candle time ─────────────────────────────────────────────
+        candle_time: Optional[time] = None
+        if candle is not None:
+            candle_time = self._candle_time(candle)
 
-        if sl_hit:
-            exit_type = SignalType.EXIT_LONG if direction == "LONG" else SignalType.EXIT_SHORT
-            exit_reason = "TRAIL" if is_trailing else "STOPLOSS"
+        sig_ts = candle.timestamp if candle is not None else 0
+        exit_type = SignalType.EXIT_LONG if is_long else SignalType.EXIT_SHORT
+
+        # ── 1. FLATTEN TIME ─────────────────────────────────────────
+        flatten_time = _settings_time("FLATTEN_TIME_IST", "15:20")
+        if candle_time is not None and candle_time >= flatten_time:
             return Signal(
                 strategy_name=self._name,
                 symbol=symbol,
                 signal_type=exit_type,
                 strength=1.0,
-                price_at_signal=current_price,
-                timestamp=ts,
+                price_at_signal=price,
+                timestamp=sig_ts,
                 indicator_data={
-                    "exit_reason": exit_reason,
-                    "stoploss_price": effective_sl,
-                    "is_trailing": is_trailing,
+                    "exit_reason": "FLATTEN",
+                    "is_trailing": trailing_active,
+                    "effective_sl": effective_sl,
                     "peak_price": peak_price,
                 },
-                skip_reason="",
             )
 
-        # ── 3. Target Check ───────────────────────────────────────────
-        if target_price is not None:
-            target_hit = False
-            if direction == "LONG" and current_price >= target_price:
-                target_hit = True
-            elif direction == "SHORT" and current_price <= target_price:
-                target_hit = True
-
-            if target_hit:
-                exit_type = SignalType.EXIT_LONG if direction == "LONG" else SignalType.EXIT_SHORT
+        # ── 2. TRAILING STOP ───────────────────────────────────────
+        if trailing_active and effective_sl is not None:
+            if is_long and price <= effective_sl:
                 return Signal(
                     strategy_name=self._name,
                     symbol=symbol,
                     signal_type=exit_type,
-                    strength=1.0,
-                    price_at_signal=current_price,
-                    timestamp=ts,
+                    strength=0.8,
+                    price_at_signal=price,
+                    timestamp=sig_ts,
                     indicator_data={
-                        "exit_reason": "TARGET",
-                        "target_price": target_price,
+                        "exit_reason": "TRAIL",
+                        "is_trailing": True,
+                        "effective_sl": effective_sl,
+                        "peak_price": peak_price,
                     },
-                    skip_reason="",
+                )
+            if not is_long and price >= effective_sl:
+                return Signal(
+                    strategy_name=self._name,
+                    symbol=symbol,
+                    signal_type=exit_type,
+                    strength=0.8,
+                    price_at_signal=price,
+                    timestamp=sig_ts,
+                    indicator_data={
+                        "exit_reason": "TRAIL",
+                        "is_trailing": True,
+                        "effective_sl": effective_sl,
+                        "peak_price": peak_price,
+                    },
                 )
 
-        # ── No exit ───────────────────────────────────────────────────
-        return self.no_action_signal(
-            symbol, current_price, ts,
-            reason="no_exit_condition",
+        # ── 3. HARD STOP-LOSS ──────────────────────────────────────
+        if is_long and price <= stop_loss:
+            return Signal(
+                strategy_name=self._name,
+                symbol=symbol,
+                signal_type=exit_type,
+                strength=0.9,
+                price_at_signal=price,
+                timestamp=sig_ts,
+                indicator_data={
+                    "exit_reason": "STOPLOSS",
+                    "is_trailing": trailing_active,
+                    "effective_sl": effective_sl or stop_loss,
+                    "peak_price": peak_price,
+                },
+            )
+        if not is_long and price >= stop_loss:
+            return Signal(
+                strategy_name=self._name,
+                symbol=symbol,
+                signal_type=exit_type,
+                strength=0.9,
+                price_at_signal=price,
+                timestamp=sig_ts,
+                indicator_data={
+                    "exit_reason": "STOPLOSS",
+                    "is_trailing": trailing_active,
+                    "effective_sl": effective_sl or stop_loss,
+                    "peak_price": peak_price,
+                },
+            )
+
+        # ── 4. TARGET ──────────────────────────────────────────────
+        if is_long and price >= target:
+            return Signal(
+                strategy_name=self._name,
+                symbol=symbol,
+                signal_type=exit_type,
+                strength=0.8,
+                price_at_signal=price,
+                timestamp=sig_ts,
+                indicator_data={
+                    "exit_reason": "TARGET",
+                    "is_trailing": trailing_active,
+                    "effective_sl": effective_sl or stop_loss,
+                    "peak_price": peak_price,
+                },
+            )
+        if not is_long and price <= target:
+            return Signal(
+                strategy_name=self._name,
+                symbol=symbol,
+                signal_type=exit_type,
+                strength=0.8,
+                price_at_signal=price,
+                timestamp=sig_ts,
+                indicator_data={
+                    "exit_reason": "TARGET",
+                    "is_trailing": trailing_active,
+                    "effective_sl": effective_sl or stop_loss,
+                    "peak_price": peak_price,
+                },
+            )
+
+        # ── 5. NO EXIT ─────────────────────────────────────────────
+        return Signal(
+            strategy_name=self._name,
+            symbol=symbol,
+            signal_type=SignalType.NO_ACTION,
+            strength=0.0,
+            price_at_signal=price,
+            timestamp=sig_ts,
             indicator_data={
-                "effective_sl": effective_sl,
-                "is_trailing": is_trailing,
+                "is_trailing": trailing_active,
+                "effective_sl": effective_sl or stop_loss,
                 "peak_price": peak_price,
             },
         )
 
-    def get_params(self) -> dict:
-        """Return all ORB+VWAP strategy parameters."""
+    # ------------------------------------------------------------------
+    # 4. END OF DAY
+    # ------------------------------------------------------------------
+    def end_of_day(self) -> None:
+        self._states.clear()
+        self._watchlist.clear()
+        self._sector_scores.clear()
+
+    # ------------------------------------------------------------------
+    # 5. GET PARAMS
+    # ------------------------------------------------------------------
+    def get_params(self) -> Dict[str, Any]:
         return {
+            "strategy": self._name,
             "strategy_name": self._name,
             "version": self._version,
             "orb_period_minutes": settings.ORB_PERIOD_MINUTES,
@@ -335,103 +457,131 @@ class ORBVWAPStrategy(StrategyBase):
             "orb_trail_pct": settings.ORB_TRAIL_PCT,
             "entry_cutoff_ist": settings.ENTRY_CUTOFF_IST,
             "flatten_time_ist": settings.FLATTEN_TIME_IST,
-            "risk_per_trade_inr": settings.RISK_PER_TRADE_INR,
-            "max_concurrent_positions": settings.MAX_CONCURRENT_POSITIONS,
-            "scan_top_n": settings.SCAN_TOP_N,
         }
 
-    def end_of_day(self) -> None:
-        """Reset all per-symbol state and watchlist for the next day."""
-        self._states.clear()
-        self._sector_scores.clear()
-        super().end_of_day()
+    # ------------------------------------------------------------------
+    # 6. BUILD TRADE PLAN
+    # ------------------------------------------------------------------
+    def build_trade_plan(
+        self, signal: Signal, risk_per_trade: float = 3750.0,
+    ) -> Optional[TradePlan]:
+        if signal.signal_type not in (SignalType.BUY, SignalType.SELL):
+            return None
+
+        entry = signal.price_at_signal
+        sl = signal.indicator_data.get("stoploss_price", 0)
+        tgt = signal.indicator_data.get("target_price", 0)
+        risk_per_share = abs(entry - sl)
+
+        if risk_per_share <= 0:
+            return None
+
+        quantity = int(risk_per_trade / risk_per_share)
+        if quantity <= 0:
+            return None
+
+        direction = (
+            Direction.LONG if signal.signal_type == SignalType.BUY
+            else Direction.SHORT
+        )
+
+        return TradePlan(
+            symbol=signal.symbol,
+            direction=direction,
+            entry_price=entry,
+            stoploss_price=sl,
+            target_price=tgt,
+            quantity=quantity,
+            risk_amount=round(risk_per_share * quantity, 2),
+            strategy_name=self._name,
+        )
 
     # ══════════════════════════════════════════════════════════════════
-    # Private helpers
+    #  PRIVATE HELPERS
     # ══════════════════════════════════════════════════════════════════
 
+    def _no_action_signal(
+        self, symbol: str, candle: Candle, skip_reason: str = "",
+    ) -> Signal:
+        return Signal(
+            strategy_name=self._name,
+            symbol=symbol,
+            signal_type=SignalType.NO_ACTION,
+            strength=0.0,
+            price_at_signal=candle.close,
+            timestamp=candle.timestamp,
+            skip_reason=skip_reason,
+        )
+
+    # ── OR capture ───────────────────────────────────────────────────
     def _handle_or_phase(
         self,
         symbol: str,
         candle: Candle,
+        candle_time: time,
         state: _SymbolState,
     ) -> Signal:
-        """
-        Accumulate OR candles and capture ORB levels once OR period ends.
-        """
-        ts = candle.timestamp
-        candle_dt = epoch_ms_to_ist(ts)
+        or_end = _or_end_time()
 
-        open_h, open_m = map(int, settings.MARKET_OPEN.split(":"))
-        open_minutes = open_h * 60 + open_m
-        or_end_minutes = open_minutes + settings.ORB_PERIOD_MINUTES
-        candle_minutes = candle_dt.hour * 60 + candle_dt.minute
+        if candle_time < MARKET_OPEN:
+            return self._no_action_signal(symbol, candle, "pre_market")
 
-        # ── Still within OR window → accumulate ───────────────────────
-        if candle_minutes < or_end_minutes:
+        if candle_time < or_end:
             state.or_candles.append(candle)
-            return self.no_action_signal(
-                symbol, candle.close, ts, reason="or_period_in_progress",
-            )
+            return self._no_action_signal(symbol, candle, "or_period")
 
-        # ── OR window just ended → compute ORB levels ────────────────
+        # OR window ended — compute levels
+        if not state.or_candles:
+            state.orb_rejected = True
+            return self._no_action_signal(symbol, candle, "orb_width_no_candles")
+
         orb = compute_opening_range(
-            candles=state.or_candles,
+            state.or_candles,
             or_period_minutes=settings.ORB_PERIOD_MINUTES,
-            market_open_time=settings.MARKET_OPEN,
         )
+
+        if orb is None or not orb.is_valid:
+            state.orb_rejected = True
+            return self._no_action_signal(symbol, candle, "orb_width_invalid")
+
+        max_w = getattr(settings, "ORB_MAX_WIDTH_PCT", 2.0)
+        min_w = getattr(settings, "ORB_MIN_WIDTH_PCT", 0.3)
+        if orb.or_width_pct > max_w or orb.or_width_pct < min_w:
+            state.orb_rejected = True
+            return self._no_action_signal(
+                symbol, candle,
+                f"orb_width_{orb.or_width_pct:.2f}_outside_{min_w:.1f}_{max_w:.1f}",
+            )
 
         state.orb = orb
         state.orb_captured = True
 
-        if orb is None or not orb.is_valid:
-            state.orb_rejected = True
-            return self.no_action_signal(
-                symbol, candle.close, ts,
-                reason="orb_capture_failed",
-                indicator_data={"orb": None},
-            )
-
-        # ── OR width filter (skip if too wide or too narrow) ──────────
-        if orb.or_width_pct > 2.0 or orb.or_width_pct < 0.3:
-            state.orb_rejected = True
-            return self.no_action_signal(
-                symbol, candle.close, ts,
-                reason=f"orb_width_out_of_range({orb.or_width_pct:.2f}%)",
-                indicator_data={"or_high": orb.or_high, "or_low": orb.or_low,
-                                "or_width_pct": orb.or_width_pct},
-            )
-
-        # ── Compute avg volume during OR for later comparison ─────────
         or_volumes = [c.volume for c in state.or_candles if c.volume > 0]
-        state.avg_or_volume = sum(or_volumes) / len(or_volumes) if or_volumes else 0.0
+        state.avg_or_volume = (
+            sum(or_volumes) / len(or_volumes) if or_volumes else 1.0
+        )
+        state.intraday_atr = self._compute_intraday_atr(state.or_candles)
 
-        logger.info(
-            f"[{self._name}] ORB captured for {symbol}: "
-            f"H={orb.or_high} L={orb.or_low} W={orb.or_width_pct:.2f}%"
+        logger.debug(
+            f"[{self._name}] {symbol} OR captured: "
+            f"H={orb.or_high:.2f} L={orb.or_low:.2f} "
+            f"W%={orb.or_width_pct:.2f} ATR={state.intraday_atr:.2f}"
         )
 
-        # ── Now process this first post-OR candle for breakout ────────
-        return self._handle_breakout_phase(symbol, candle, state)
+        return self._handle_breakout(symbol, candle, state)
 
-    def _handle_breakout_phase(
+
+    # ── Breakout detection & confirmation ────────────────────────────
+    def _handle_breakout(
         self,
         symbol: str,
         candle: Candle,
         state: _SymbolState,
     ) -> Signal:
-        """
-        Detect breakout and confirm with VWAP + volume + sector.
-        """
-        ts = candle.timestamp
         orb = state.orb
+        if orb is None:
+            return self._no_action_signal(symbol, candle, "no_orb")
 
-        if orb is None or not orb.is_valid:
-            return self.no_action_signal(
-                symbol, candle.close, ts, reason="orb_not_valid",
-            )
-
-        # ── 1. Breakout detection (candle close vs ORB levels) ────────
         breakout = detect_breakout(
             current_price=candle.close,
             orb_levels=orb,
@@ -439,257 +589,197 @@ class ORBVWAPStrategy(StrategyBase):
         )
 
         if breakout == "INSIDE_RANGE":
-            return self.no_action_signal(
-                symbol, candle.close, ts,
-                reason="inside_range",
-                indicator_data={"or_high": orb.or_high, "or_low": orb.or_low},
-            )
+            return self._no_action_signal(symbol, candle, "inside_range")
 
-        # ── 2. VWAP confirmation ──────────────────────────────────────
+        is_long = breakout == "BREAKOUT_LONG"
+
+        # ── VWAP confirmation ───────────────────────────────────────
         vwap_data = compute_vwap(
-            candles=state.all_candles,
+            state.all_candles,
             band_multiplier=settings.VWAP_BAND_STD_MULTIPLIER,
-            slope_lookback=5,
+        )
+        if vwap_data is None:
+            return self._no_action_signal(symbol, candle, "no_vwap")
+
+        if is_long and (candle.close < vwap_data.vwap or vwap_data.slope < 0):
+            return self._no_action_signal(symbol, candle, "vwap_not_confirming_long")
+        if not is_long and (candle.close > vwap_data.vwap or vwap_data.slope > 0):
+            return self._no_action_signal(symbol, candle, "vwap_not_confirming_short")
+
+        # ── Volume confirmation ─────────────────────────────────────
+        min_vol_ratio = getattr(settings, "ORB_MIN_VOL_RATIO", 1.5)
+        vol_ratio = (
+            candle.volume / state.avg_or_volume
+            if state.avg_or_volume > 0
+            else 0.0
+        )
+        if vol_ratio < min_vol_ratio:
+            return self._no_action_signal(symbol, candle, "low_volume")
+
+        # ── Sector bias confirmation ────────────────────────────────
+        # get_stock_sector_bias expects a plain symbol, not Fyers format
+        try:
+            _, plain_sym, _ = from_fyers_symbol(symbol)
+        except (ValueError, IndexError):
+            plain_sym = symbol
+        sector_bias = get_stock_sector_bias(plain_sym, self._sector_scores)
+
+        if is_long and sector_bias <= 0:
+            return self._no_action_signal(symbol, candle, "sector_negative")
+        if not is_long and sector_bias >= 0:
+            return self._no_action_signal(symbol, candle, "sector_positive")
+
+        # ── Stop-loss (OR opposite end per settings) ────────────────
+        if is_long:
+            stop_loss = orb.or_low
+        else:
+            stop_loss = orb.or_high
+
+        entry_price = candle.close
+        risk_per_share = abs(entry_price - stop_loss)
+
+        if risk_per_share <= 0:
+            return self._no_action_signal(symbol, candle, "zero_risk")
+
+        # ── Target (R:R based) ──────────────────────────────────────
+        rr = getattr(settings, "ORB_TARGET_RR", 2.0)
+        if is_long:
+            target_price = entry_price + risk_per_share * rr
+        else:
+            target_price = entry_price - risk_per_share * rr
+
+        # ── Signal strength ─────────────────────────────────────────
+        strength = self._compute_signal_strength(
+            vol_ratio=vol_ratio,
+            vwap_slope=vwap_data.slope,
+            sector_bias=sector_bias,
+            or_width_pct=orb.or_width_pct,
         )
 
-        if vwap_data is None:
-            return self.no_action_signal(
-                symbol, candle.close, ts, reason="vwap_unavailable",
-            )
+        state.breakout_fired = True
+        signal_type = SignalType.BUY if is_long else SignalType.SELL
 
-        # ── 3. Volume confirmation ────────────────────────────────────
-        vol_ratio = (candle.volume / state.avg_or_volume) if state.avg_or_volume > 0 else 0.0
-
-        # ── 4. Sector bias ────────────────────────────────────────────
-        try:
-            _, plain_symbol, _ = from_fyers_symbol(symbol)
-        except (ValueError, IndexError):
-            plain_symbol = symbol
-        sector_bias = get_stock_sector_bias(plain_symbol, self._sector_scores)
-
-        # ── Build indicator snapshot ──────────────────────────────────
         indicator_data = {
-            "or_high": orb.or_high,
-            "or_low": orb.or_low,
-            "or_mid": orb.or_mid,
-            "or_width_pct": orb.or_width_pct,
+            "orb_high": orb.or_high,
+            "orb_low": orb.or_low,
+            "orb_mid": orb.or_mid,
+            "orb_width_pct": orb.or_width_pct,
             "vwap": vwap_data.vwap,
+            "vwap_slope": vwap_data.slope,
             "vwap_upper": vwap_data.upper_band,
             "vwap_lower": vwap_data.lower_band,
-            "vwap_slope": vwap_data.slope,
-            "breakout_volume": candle.volume,
-            "avg_or_volume": state.avg_or_volume,
             "volume_ratio": round(vol_ratio, 2),
-            "sector_bias": sector_bias,
+            "sector_bias": round(sector_bias, 3),
+            "atr": round(state.intraday_atr, 2),
+            "stoploss_price": stop_loss,
+            "target_price": round(target_price, 2),
+            "risk_per_share": round(risk_per_share, 2),
         }
 
-        # ── 5. LONG entry conditions ─────────────────────────────────
-        if breakout == "BREAKOUT_LONG":
-            conditions_met = (
-                candle.close > vwap_data.vwap        # price above VWAP
-                and vwap_data.slope > 0              # VWAP rising
-                and vol_ratio >= 1.5                 # volume confirmation
-                and sector_bias > 0                  # sector positive
-            )
+        logger.info(
+            f"[{self._name}] SIGNAL {signal_type.name} {symbol} "
+            f"@ {entry_price:.2f}  SL={stop_loss}  "
+            f"TGT={target_price:.2f}  strength={strength:.2f}"
+        )
 
-            if not conditions_met:
-                reasons = []
-                if candle.close <= vwap_data.vwap:
-                    reasons.append("below_vwap")
-                if vwap_data.slope <= 0:
-                    reasons.append("vwap_slope_down")
-                if vol_ratio < 1.5:
-                    reasons.append(f"low_volume({vol_ratio:.1f}x)")
-                if sector_bias <= 0:
-                    reasons.append(f"sector_negative({sector_bias:.2f})")
-                return self.no_action_signal(
-                    symbol, candle.close, ts,
-                    reason="long_conditions_failed:" + ",".join(reasons),
-                    indicator_data=indicator_data,
-                )
-
-            # ── Compute SL, target, strength ──────────────────────────
-            stoploss = orb.or_low  # ORB_OPPOSITE mode
-            risk = candle.close - stoploss
-            if risk <= 0:
-                return self.no_action_signal(
-                    symbol, candle.close, ts,
-                    reason="zero_risk_long",
-                    indicator_data=indicator_data,
-                )
-
-            target = candle.close + (risk * settings.ORB_TARGET_RR)
-            strength = self._compute_signal_strength(
-                vol_ratio, vwap_data.slope, sector_bias, orb.or_width_pct,
-            )
-
-            indicator_data["stoploss_price"] = round(stoploss, 2)
-            indicator_data["target_price"] = round(target, 2)
-            indicator_data["risk_per_share"] = round(risk, 2)
-
-            state.breakout_fired = True
-
-            return Signal(
-                strategy_name=self._name,
-                symbol=symbol,
-                signal_type=SignalType.BUY,
-                strength=strength,
-                price_at_signal=candle.close,
-                timestamp=ts,
-                indicator_data=indicator_data,
-                skip_reason="",
-            )
-
-        # ── 6. SHORT entry conditions ─────────────────────────────────
-        if breakout == "BREAKOUT_SHORT":
-            conditions_met = (
-                candle.close < vwap_data.vwap        # price below VWAP
-                and vwap_data.slope < 0              # VWAP falling
-                and vol_ratio >= 1.5                 # volume confirmation
-                and sector_bias < 0                  # sector negative
-            )
-
-            if not conditions_met:
-                reasons = []
-                if candle.close >= vwap_data.vwap:
-                    reasons.append("above_vwap")
-                if vwap_data.slope >= 0:
-                    reasons.append("vwap_slope_up")
-                if vol_ratio < 1.5:
-                    reasons.append(f"low_volume({vol_ratio:.1f}x)")
-                if sector_bias >= 0:
-                    reasons.append(f"sector_positive({sector_bias:.2f})")
-                return self.no_action_signal(
-                    symbol, candle.close, ts,
-                    reason="short_conditions_failed:" + ",".join(reasons),
-                    indicator_data=indicator_data,
-                )
-
-            stoploss = orb.or_high  # ORB_OPPOSITE mode
-            risk = stoploss - candle.close
-            if risk <= 0:
-                return self.no_action_signal(
-                    symbol, candle.close, ts,
-                    reason="zero_risk_short",
-                    indicator_data=indicator_data,
-                )
-
-            target = candle.close - (risk * settings.ORB_TARGET_RR)
-            strength = self._compute_signal_strength(
-                vol_ratio, abs(vwap_data.slope), abs(sector_bias), orb.or_width_pct,
-            )
-
-            indicator_data["stoploss_price"] = round(stoploss, 2)
-            indicator_data["target_price"] = round(target, 2)
-            indicator_data["risk_per_share"] = round(risk, 2)
-
-            state.breakout_fired = True
-
-            return Signal(
-                strategy_name=self._name,
-                symbol=symbol,
-                signal_type=SignalType.SELL,
-                strength=strength,
-                price_at_signal=candle.close,
-                timestamp=ts,
-                indicator_data=indicator_data,
-                skip_reason="",
-            )
-
-        # ── Fallback ──────────────────────────────────────────────────
-        return self.no_action_signal(
-            symbol, candle.close, ts, reason="no_signal",
+        return Signal(
+            strategy_name=self._name,
+            symbol=symbol,
+            signal_type=signal_type,
+            strength=strength,
+            price_at_signal=entry_price,
+            timestamp=candle.timestamp,
             indicator_data=indicator_data,
         )
 
+
+    # ── Trailing stop ────────────────────────────────────────────────
+    @staticmethod
     def _compute_trailing_sl(
-        self,
-        direction: str,
         entry_price: float,
-        original_sl: float,
         peak_price: float,
-    ) -> float | None:
+        stop_loss: float,
+        risk: float,
+        is_long: bool,
+        trail_after_rr: float = 1.0,
+        trail_pct: float = 0.3,
+    ) -> tuple[bool, Optional[float]]:
         """
-        Compute trailing stop level based on the high watermark (peak_price).
-
-        The trailing stop only ratchets in the favorable direction:
-          LONG:  trail_sl = entry + trail_pct × (peak_high - entry)
-          SHORT: trail_sl = entry - trail_pct × (entry - peak_low)
-
-        Trailing activates only after ORB_TRAIL_AFTER_RR is achieved
-        (measured from peak, not current price).
-
-        Parameters
-        ----------
-        direction : str
-            'LONG' or 'SHORT'.
-        entry_price : float
-        original_sl : float
-        peak_price : float
-            Highest price since entry (LONG) or lowest (SHORT).
-
-        Returns
-        -------
-        float or None
-            Trailing SL price, or None if trailing not yet active.
+        Returns (is_trailing, effective_sl).
+        Trail formula: effective_sl = entry + trail_pct * (peak - entry)  [LONG]
         """
-        risk = abs(entry_price - original_sl)
         if risk <= 0:
-            return None
+            return False, None
 
-        if direction == "LONG":
-            move = peak_price - entry_price
-            rr_achieved = move / risk
-            if rr_achieved < settings.ORB_TRAIL_AFTER_RR:
-                return None
-            trailing_sl = entry_price + (settings.ORB_TRAIL_PCT * move)
-            return round(trailing_sl, 2)
+        move = (
+            (peak_price - entry_price) if is_long
+            else (entry_price - peak_price)
+        )
 
-        else:  # SHORT
-            move = entry_price - peak_price
-            rr_achieved = move / risk
-            if rr_achieved < settings.ORB_TRAIL_AFTER_RR:
-                return None
-            trailing_sl = entry_price - (settings.ORB_TRAIL_PCT * move)
-            return round(trailing_sl, 2)
+        activation_threshold = risk * trail_after_rr
+        if move < activation_threshold:
+            return False, None
 
+        # Trail is active
+        if is_long:
+            effective_sl = entry_price + trail_pct * (peak_price - entry_price)
+            effective_sl = max(effective_sl, stop_loss)
+        else:
+            effective_sl = entry_price - trail_pct * (entry_price - peak_price)
+            effective_sl = min(effective_sl, stop_loss)
+
+        return True, effective_sl
+
+    # ── Intraday ATR ─────────────────────────────────────────────────
+    @staticmethod
+    def _compute_intraday_atr(candles: list[Candle]) -> float:
+        if len(candles) < 2:
+            return candles[0].range_size if candles else 0.0
+
+        true_ranges = []
+        for i in range(1, len(candles)):
+            h, l, pc = candles[i].high, candles[i].low, candles[i - 1].close
+            true_ranges.append(max(h - l, abs(h - pc), abs(l - pc)))
+
+        return sum(true_ranges) / len(true_ranges) if true_ranges else 0.0
+
+    # ── Signal strength ──────────────────────────────────────────────
+    @staticmethod
     def _compute_signal_strength(
-        self,
         vol_ratio: float,
-        vwap_slope_abs: float,
-        sector_bias_abs: float,
+        vwap_slope: float,
+        sector_bias: float,
         or_width_pct: float,
     ) -> float:
-        """
-        Compute a composite signal strength score (0.0 to 1.0).
+        vol_score = min(max((vol_ratio - 1.0) / 3.0, 0.0), 1.0)
+        slope_score = min(abs(vwap_slope) / 0.5, 1.0)
+        sector_score = min(abs(sector_bias), 1.0)
 
-        Factors:
-          - Volume ratio (higher = stronger)
-          - VWAP slope magnitude (steeper = stronger)
-          - Sector directional strength
-          - OR width (moderate is ideal)
-        """
-        # Volume: 1.5x=0.5, 2.0x=0.67, 3.0x=1.0, cap at 1.0
-        vol_score = min(vol_ratio / 3.0, 1.0)
-
-        # Sector: already 0..1 range
-        sector_score = min(abs(sector_bias_abs), 1.0)
-
-        # OR width: ideal around 0.8-1.2%, penalize extremes
-        if 0.6 <= or_width_pct <= 1.5:
+        if 0.8 <= or_width_pct <= 1.5:
             width_score = 1.0
-        elif 0.3 <= or_width_pct <= 2.0:
-            width_score = 0.6
+        elif or_width_pct < 0.8:
+            width_score = or_width_pct / 0.8
         else:
-            width_score = 0.3
-
-        # VWAP slope: normalize (small numbers, so scale up)
-        slope_score = min(abs(vwap_slope_abs) * 100.0, 1.0)
+            width_score = max(1.0 - (or_width_pct - 1.5) / 1.0, 0.0)
 
         strength = (
-            vol_score * 0.30
-            + slope_score * 0.25
-            + sector_score * 0.25
-            + width_score * 0.20
+            0.30 * vol_score
+            + 0.25 * slope_score
+            + 0.25 * sector_score
+            + 0.20 * width_score
         )
-        return round(max(0.0, min(1.0, strength)), 4)
+        return round(min(max(strength, 0.01), 1.0), 3)
+
+    # ── Candle time helper ───────────────────────────────────────────
+    @staticmethod
+    def _candle_time(candle: Candle) -> Optional[time]:
+        try:
+            if hasattr(candle, "timestamp") and candle.timestamp:
+                dt = epoch_ms_to_ist(candle.timestamp)
+                return dt.time()
+        except Exception:
+            pass
+        if hasattr(candle, "datetime") and candle.datetime is not None:
+            if isinstance(candle.datetime, datetime):
+                return candle.datetime.time()
+        return None

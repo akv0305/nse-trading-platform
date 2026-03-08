@@ -87,8 +87,8 @@ class BacktestEngine:
         # ── 1. Pre-market scan using daily data ───────────────────────
         # Strategy expects Fyers-format symbols and DataFrames
         watchlist = self._strategy.pre_market_scan(
-            universe=list(data.keys()),
-            historical_data=data,
+            list(data.keys()),
+            data,
         )
 
         if not watchlist:
@@ -160,8 +160,8 @@ class BacktestEngine:
 
                 # Re-run pre_market_scan for new day
                 self._strategy.pre_market_scan(
-                    universe=list(data.keys()),
-                    historical_data=data,
+                    list(data.keys()),
+                    data,
                 )
 
                 current_day = day_str
@@ -181,12 +181,7 @@ class BacktestEngine:
                     pos["peak_price"] = min(pos.get("peak_price", pos["entry_price"]), candle.low)
                 pos["last_price"] = candle.close
 
-                exit_signal = self._strategy.should_exit(
-                    symbol=symbol,
-                    current_price=candle.close,
-                    position=pos,
-                    candle=candle,
-                )
+                exit_signal = self._strategy.should_exit(symbol, candle.close, pos, candle)
 
                 if exit_signal.signal_type in (SignalType.EXIT_LONG, SignalType.EXIT_SHORT):
                     exit_reason = exit_signal.indicator_data.get("exit_reason", "UNKNOWN")
@@ -208,10 +203,8 @@ class BacktestEngine:
                 current_pos = open_positions[symbol]
 
             entry_signal = self._strategy.on_candle(
-                symbol=symbol,
-                candle=candle,
-                candle_history=candle_history[symbol],
-                current_position=current_pos,
+                symbol, candle, candle_history[symbol],
+                open_positions.get(symbol),
             )
 
             if entry_signal.signal_type in (SignalType.BUY, SignalType.SELL):
@@ -263,6 +256,7 @@ class BacktestEngine:
                     "last_price": candle.close,
                     "indicator_data": entry_signal.indicator_data,
                 }
+
 
             # ── Record equity at each candle ──────────────────────────
             unrealised = 0.0

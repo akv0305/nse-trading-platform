@@ -210,8 +210,8 @@ class TestResolveSymbols:
         from scripts.download_history import _resolve_symbols
 
         symbols = _resolve_symbols("RELIANCE,INFY")
-        # 2 stocks + 13 sector indices + 1 NIFTY50 index = 16
-        assert len(symbols) == 16
+        # 2 stocks + 12 sector indices + 1 NIFTY50 index = 15
+        assert len(symbols) == 15
         assert "NSE:RELIANCE-EQ" in symbols
         assert "NSE:INFY-EQ" in symbols
 
