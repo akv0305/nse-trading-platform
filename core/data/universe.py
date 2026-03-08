@@ -32,7 +32,6 @@ NIFTY50: list[str] = [
     "ETERNAL",
     "GRASIM",
     "HCLTECH",
-    "HDFC",
     "HDFCBANK",
     "HDFCLIFE",
     "HEROMOTOCO",
@@ -57,7 +56,7 @@ NIFTY50: list[str] = [
     "SHRIRAMFIN",
     "SUNPHARMA",
     "TATACONSUM",
-    "TATAMOTORS",
+    "TMPV",
     "TATASTEEL",
     "TCS",
     "TECHM",
@@ -66,7 +65,8 @@ NIFTY50: list[str] = [
     "ULTRACEMCO",
     "WIPRO",
 ]
-
+# Note: 49 symbols. HDFC removed (merged), TATAMOTORS → TMPV.
+# NSE rebalances in March & September; verify current constituents.
 
 # ── Sector Mapping ────────────────────────────────────────────────────────
 # Maps each Nifty 50 stock to its primary sector.
@@ -90,7 +90,6 @@ SECTOR_MAP: dict[str, str] = {
     "ETERNAL": "Consumer",
     "GRASIM": "Cement",
     "HCLTECH": "IT",
-    "HDFC": "Financial Services",
     "HDFCBANK": "Banking",
     "HDFCLIFE": "Insurance",
     "HEROMOTOCO": "Auto",
@@ -115,7 +114,7 @@ SECTOR_MAP: dict[str, str] = {
     "SHRIRAMFIN": "Financial Services",
     "SUNPHARMA": "Pharma",
     "TATACONSUM": "FMCG",
-    "TATAMOTORS": "Auto",
+    "TMPV": "Auto",
     "TATASTEEL": "Metals & Mining",
     "TCS": "IT",
     "TECHM": "IT",
@@ -127,6 +126,9 @@ SECTOR_MAP: dict[str, str] = {
 
 
 # ── Sector Index Symbols (Fyers format) ───────────────────────────────────
+# ── Fix SECTOR_INDICES ────────────────────────────────────────────────────
+# NSE:NIFTYFINSERVICE-INDEX → NSE:FINNIFTY-INDEX (confirmed by Fyers)
+# Remove NIFTY PRIVATE BANK (symbol not available on Fyers API)
 
 SECTOR_INDICES: dict[str, str] = {
     "NIFTY BANK": "NSE:NIFTYBANK-INDEX",
@@ -140,8 +142,7 @@ SECTOR_INDICES: dict[str, str] = {
     "NIFTY INFRA": "NSE:NIFTYINFRA-INDEX",
     "NIFTY PSE": "NSE:NIFTYPSE-INDEX",
     "NIFTY MEDIA": "NSE:NIFTYMEDIA-INDEX",
-    "NIFTY FIN SERVICE": "NSE:NIFTYFINSERVICE-INDEX",
-    "NIFTY PRIVATE BANK": "NSE:NIFTYPRIVATEBANK-INDEX",
+    "NIFTY FIN SERVICE": "NSE:FINNIFTY-INDEX"
 }
 
 

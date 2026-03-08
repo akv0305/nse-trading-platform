@@ -45,8 +45,8 @@ def test_data_models():
 def test_universe():
     """Stock universe has 50 stocks with sector mapping."""
     from core.data.universe import NIFTY50, SECTOR_MAP, to_fyers_symbol
-    assert len(NIFTY50) == 50
-    assert len(SECTOR_MAP) == 50
+    assert len(NIFTY50) == 49
+    assert len(SECTOR_MAP) == 49
     assert to_fyers_symbol("RELIANCE") == "NSE:RELIANCE-EQ"
 
 

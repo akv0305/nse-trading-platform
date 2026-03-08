@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     FYERS_REDIRECT_URI: str = Field(default="https://127.0.0.1", description="OAuth redirect URI registered in Fyers app")
     FYERS_ACCESS_TOKEN: str = Field(default="", description="Current session access token (refreshed daily)")
     FYERS_PIN: str = Field(default="", description="4-digit PIN for Fyers login automation (optional)")
+    FYERS_TOTP_KEY: str = ""         # External 2FA TOTP secret key from myaccount.fyers.in
+    FYERS_USER_ID: str = ""          # Fyers client ID (e.g., "AB1234")
 
     # ── Capital & Risk ────────────────────────────────────────────────────
     TOTAL_CAPITAL: float = Field(default=750_000.0, description="Total trading capital in INR")
@@ -155,10 +157,7 @@ class Settings(BaseSettings):
         """Hard daily loss limit in INR."""
         return self.TOTAL_CAPITAL * (self.DAILY_LOSS_LIMIT_PCT / 100.0)
 
-    class Config:
-        env_file = str(_PROJECT_ROOT / ".env")
-        env_file_encoding = "utf-8"
-        extra = "ignore"  # Ignore unknown env vars silently
+    model_config = {"env_file": str(_PROJECT_ROOT / ".env"), "env_file_encoding": "utf-8", "extra": "ignore"}
 
 
 # ---------------------------------------------------------------------------

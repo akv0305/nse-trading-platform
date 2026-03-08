@@ -61,3 +61,5 @@ desktop.ini
 # ── Fyers Token Cache ────────────────────────────────────────────────────
 fyers_token.json
 access_token.txt
+storage/fyers_token.json
+storage/broker_token.json
