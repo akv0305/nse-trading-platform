@@ -44,9 +44,12 @@ def _create_strategy(name: str):
     if name_lower == "orb_vwap":
         from core.strategies.orb_vwap import ORBVWAPStrategy
         return ORBVWAPStrategy()
+    elif name_lower in ("vmr_vwap", "vmr", "vwap_mean_reversion"):
+        from core.strategies.vmr_strategy import VMRStrategy
+        return VMRStrategy()
     else:
         raise ValueError(
-            f"Unknown strategy '{name}'. Supported: orb_vwap"
+            f"Unknown strategy '{name}'. Supported: orb_vwap, vmr_vwap"
         )
 
 

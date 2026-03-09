@@ -185,9 +185,24 @@ class BacktestEngine:
 
                 if exit_signal.signal_type in (SignalType.EXIT_LONG, SignalType.EXIT_SHORT):
                     exit_reason = exit_signal.indicator_data.get("exit_reason", "UNKNOWN")
-                    exit_price = self._apply_slippage(
-                        candle.close, pos["direction"], is_exit=True,
-                    )
+                    
+                    # For STOPLOSS exits, use the SL price (not candle close)
+                    # to simulate limit/SL-M order execution
+                    if exit_reason == "STOPLOSS":
+                        sl_price = pos.get("stoploss_price", candle.close)
+                        exit_price = self._apply_slippage(
+                            sl_price, pos["direction"], is_exit=True,
+                        )
+                    elif exit_reason == "TARGET":
+                        tgt_price = pos.get("target_price", candle.close)
+                        exit_price = self._apply_slippage(
+                            tgt_price, pos["direction"], is_exit=True,
+                        )
+                    else:
+                        exit_price = self._apply_slippage(
+                            candle.close, pos["direction"], is_exit=True,
+                        )
+
                     trade = self._close_position(pos, exit_price, ts, exit_reason)
                     all_trades.append(trade)
                     capital += trade["pnl_net"]
@@ -230,8 +245,15 @@ class BacktestEngine:
                     continue
 
                 # Capital check
-                risk_budget = min(settings.RISK_PER_TRADE_INR, capital * 0.02)
-                quantity = int(risk_budget / risk_per_share)
+                # Use strategy-provided quantity if available (VMR uses fixed loss sizing)
+                strategy_qty = entry_signal.indicator_data.get("quantity")
+                if strategy_qty and strategy_qty > 0:
+                    quantity = strategy_qty
+                else:
+                    # Fallback: engine-level sizing
+                    risk_budget = min(settings.RISK_PER_TRADE_INR, capital * 0.02)
+                    quantity = int(risk_budget / risk_per_share)
+                
                 if quantity <= 0:
                     continue
 
@@ -239,6 +261,13 @@ class BacktestEngine:
                 position_value = entry_price * quantity
                 if position_value > capital:
                     quantity = int(capital / entry_price)
+                    if quantity <= 0:
+                        continue
+
+                # Cap position value at 20% of current capital
+                max_position_value = capital * 0.20
+                if position_value > max_position_value:
+                    quantity = int(max_position_value / entry_price)
                     if quantity <= 0:
                         continue
 
