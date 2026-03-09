@@ -1,6 +1,7 @@
 """
-Tests for VMR (VWAP Mean-Reversion) Strategy
-=============================================
+Tests for VMR (VWAP Mean-Reversion) Strategy — v2.0
+====================================================
+Updated for pending-confirmation entry logic.
 Run: pytest tests/test_vmr_strategy.py -v
 """
 
@@ -117,6 +118,9 @@ class TestVMRInit:
         assert p["strategy_name"] == "vmr_vwap"
         assert "band_sd_threshold" in p
         assert "trail_pct" in p
+        assert "fixed_loss_per_trade" in p
+        assert "min_atr_multiplier" in p
+        assert "require_confirmation" in p
 
     def test_repr(self):
         s = VMRStrategy()
@@ -174,11 +178,12 @@ class TestVMROnCandle:
         assert sig.signal_type == SignalType.NO_ACTION
         assert "position_open" in sig.skip_reason
 
-    def test_bullish_hammer_at_lower_band_generates_buy(self):
+    def test_bullish_hammer_sets_pending_then_confirms(self):
         """
         After warmup (VWAP ~1000), inject a hammer candle at -1.5SD.
-        VWAP std_dev computed from warmup candles ≈ small.
-        We need the low to breach lower_1_5sd.
+        The hammer should set a pending trigger (NO_ACTION with
+        'awaiting_confirmation'). Then the next candle crossing
+        pin_bar.high + 1 tick should fire the BUY signal.
         """
         sym = "NSE:HDFCBANK-EQ"
         s = VMRStrategy()
@@ -187,12 +192,10 @@ class TestVMROnCandle:
 
         # Build candles with enough variance to create real bands
         history: list[Candle] = []
-        # First create a spread of candles to establish VWAP with some SD
         for i in range(15):
             minute = 15 + i * 5
             h = 9 + minute // 60
             m = minute % 60
-            # Alternate high and low to create variance
             if i % 2 == 0:
                 c = _candle(sym, h, m, 1010, 1015, 1005, 1012, 50000)
             else:
@@ -200,23 +203,81 @@ class TestVMROnCandle:
             history.append(c)
             s.on_candle(sym, c, history, None)
 
-        # Now inject a clear hammer at the lower band
-        # VWAP should be ~1000, SD ~10, lower_1.5sd ~985
+        # Inject a clear hammer at the lower band
+        # VWAP ~1000, SD ~10, lower_1.5sd ~985
         hammer = _candle(
             sym, 10, 40,
-            o=984, hi=986, lo=975, c=985,  # long lower wick, body at top
+            o=984, hi=986, lo=975, c=985,
             volume=80000,
         )
         history.append(hammer)
-        sig = s.on_candle(sym, hammer, history, None)
+        sig1 = s.on_candle(sym, hammer, history, None)
 
-        # This might be BUY or NO_ACTION depending on exact band values
-        # The test validates the flow works without errors
-        assert sig.signal_type in (SignalType.BUY, SignalType.NO_ACTION)
-        if sig.signal_type == SignalType.BUY:
-            assert sig.indicator_data["stoploss_price"] < sig.price_at_signal
-            assert sig.indicator_data["target_price"] > sig.price_at_signal
-            assert sig.strength > 0
+        # The hammer may set a pending trigger or be filtered out
+        # depending on exact band values and ATR
+        if sig1.skip_reason == "awaiting_confirmation":
+            # Pending trigger was set — now confirm with next candle
+            # that crosses above pin_bar.high (986) + 1 tick = 986.05
+            confirm_candle = _candle(
+                sym, 10, 45,
+                o=985, hi=988, lo=984, c=987,
+                volume=70000,
+            )
+            history.append(confirm_candle)
+            sig2 = s.on_candle(sym, confirm_candle, history, None)
+
+            assert sig2.signal_type == SignalType.BUY
+            assert sig2.indicator_data["stoploss_price"] < sig2.price_at_signal
+            assert sig2.indicator_data["target_price"] > sig2.price_at_signal
+            assert sig2.indicator_data["trigger_price"] > hammer.high
+            assert sig2.strength > 0
+        else:
+            # Pin bar was filtered out (band width, ATR, nose, etc.)
+            assert sig1.signal_type == SignalType.NO_ACTION
+
+    def test_pending_trigger_expires_if_not_confirmed(self):
+        """If the next candle doesn't cross the trigger, signal is cancelled."""
+        sym = "NSE:HDFCBANK-EQ"
+        s = VMRStrategy()
+        s._sector_scores = {"NIFTY BANK": 0.3}
+        s._states[sym] = _VMRState(prev_day_close=1000.0)
+
+        history: list[Candle] = []
+        for i in range(15):
+            minute = 15 + i * 5
+            h = 9 + minute // 60
+            m = minute % 60
+            if i % 2 == 0:
+                c = _candle(sym, h, m, 1010, 1015, 1005, 1012, 50000)
+            else:
+                c = _candle(sym, h, m, 990, 995, 985, 988, 50000)
+            history.append(c)
+            s.on_candle(sym, c, history, None)
+
+        # Inject hammer
+        hammer = _candle(
+            sym, 10, 40,
+            o=984, hi=986, lo=975, c=985,
+            volume=80000,
+        )
+        history.append(hammer)
+        sig1 = s.on_candle(sym, hammer, history, None)
+
+        if sig1.skip_reason == "awaiting_confirmation":
+            # Next candle does NOT cross trigger (stays below 986.05)
+            no_confirm = _candle(
+                sym, 10, 45,
+                o=984, hi=985, lo=983, c=984,  # high=985 < trigger
+                volume=60000,
+            )
+            history.append(no_confirm)
+            sig2 = s.on_candle(sym, no_confirm, history, None)
+
+            assert sig2.signal_type == SignalType.NO_ACTION
+            assert "confirmation_failed" in sig2.skip_reason
+
+            # Pending trigger should be cleared
+            assert s._states[sym].pending_trigger is None
 
     def test_past_cutoff_no_signal(self):
         s, history = _setup_strategy_with_warmup()
@@ -227,12 +288,26 @@ class TestVMROnCandle:
         assert sig.signal_type == SignalType.NO_ACTION
         assert "cutoff" in sig.skip_reason
 
+    def test_past_cutoff_cancels_pending_trigger(self):
+        """If a pending trigger exists and we pass cutoff, it's cancelled."""
+        sym = "NSE:HDFCBANK-EQ"
+        s = VMRStrategy()
+        s._states[sym] = _VMRState(prev_day_close=1000.0)
+        # Manually set a pending trigger
+        s._states[sym].pending_trigger = {
+            "is_long": True, "trigger_price": 986.05,
+        }
+        c = _candle(sym, 14, 50, 980, 985, 975, 981, 80000)
+        sig = s.on_candle(sym, c, [c], None)
+        assert sig.signal_type == SignalType.NO_ACTION
+        assert "cutoff" in sig.skip_reason
+        assert s._states[sym].pending_trigger is None
+
     def test_gap_too_wide_rejected(self):
         s = VMRStrategy()
         sym = "NSE:HDFCBANK-EQ"
         s._states[sym] = _VMRState(prev_day_close=1000.0)
 
-        # First candle gaps 5% up
         candles = []
         for i in range(10):
             minute = 15 + i * 5
@@ -242,7 +317,6 @@ class TestVMROnCandle:
             candles.append(c)
             s.on_candle(sym, c, candles, None)
 
-        # After gap detection, subsequent candles should be rejected
         c_late = _candle(sym, 10, 0, 1060, 1065, 1055, 1062, 80000)
         candles.append(c_late)
         sig = s.on_candle(sym, c_late, candles, None)
@@ -255,14 +329,9 @@ class TestVMROnCandle:
         s = VMRStrategy()
         s._sector_scores = {"NIFTY BANK": 0.3}
         s._states[sym] = _VMRState(prev_day_close=1000.0)
-
-        # Force signal_fired = True
         s._states[sym].signal_fired = True
 
         history = _build_warmup_candles(sym, 1000.0, 15)
-        for c in history:
-            pass  # don't feed to strategy, just build history
-
         c_new = _candle(sym, 11, 0, 980, 985, 970, 982, 80000)
         history.append(c_new)
         sig = s.on_candle(sym, c_new, history, None)
@@ -350,12 +419,11 @@ class TestVMRShouldExit:
         )
         candle = _candle("NSE:TEST-EQ", 11, 0, 995, 998, 993, 996)
         sig = s.should_exit("NSE:TEST-EQ", 996.0, pos, candle)
-        assert sig.indicator_data["peak_price"] == 998  # updated from candle.high
+        assert sig.indicator_data["peak_price"] == 998
 
     def test_flatten_overrides_target(self):
         s = VMRStrategy()
         pos = self._make_position(direction="LONG", entry=985, sl=972, target=1000)
-        # At flatten time, price is above target
         candle = _candle("NSE:TEST-EQ", 15, 25, 1001, 1003, 999, 1002)
         sig = s.should_exit("NSE:TEST-EQ", 1002.0, pos, candle)
         assert sig.signal_type == SignalType.EXIT_LONG
@@ -431,7 +499,6 @@ class TestVMRBacktestIntegration:
         engine = BacktestEngine(strategy, FyersCostModel())
 
         sym = to_fyers_symbol("HDFCBANK")
-        # Build simple 1-day data
         rows = []
         base = 1500.0
         for i in range(75):

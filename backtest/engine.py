@@ -3,8 +3,6 @@ NSE Trading Platform — Backtest Engine
 
 Event-driven backtester that simulates strategy execution on historical data.
 Uses the same StrategyBase interface as live trading for consistency.
-
-Implementation: Strategy 1 conversation (alongside ORB+VWAP).
 """
 
 from __future__ import annotations
@@ -34,12 +32,6 @@ class BacktestEngine:
       - Transaction costs (FyersCostModel)
       - Position tracking and P&L
       - Risk management rules
-
-    Usage
-    -----
-    >>> engine = BacktestEngine(strategy, cost_model)
-    >>> result = engine.run(data, initial_capital=750000)
-    >>> print(f"Net P&L: ₹{result.total_pnl:,.2f}")
     """
 
     def __init__(
@@ -63,29 +55,24 @@ class BacktestEngine:
         Parameters
         ----------
         data : dict[str, pd.DataFrame]
-            Symbol → OHLCV DataFrame (intraday 5m candles).
-            DataFrame must have columns: timestamp, open, high, low, close, volume.
+            Symbol → OHLCV DataFrame (intraday candles).
         initial_capital : float
             Starting capital in INR.
-        start_date : str, optional
-            Filter data from this date. 'YYYY-MM-DD'.
-        end_date : str, optional
-            Filter data to this date.
+        start_date, end_date : str, optional
+            Filter data range. 'YYYY-MM-DD'.
 
         Returns
         -------
         BacktestResult
-            Complete backtest results with trade list and equity curve.
         """
         wall_start = time.time()
 
         capital = initial_capital
         all_trades: list[dict] = []
         equity_curve: list[tuple[int, float]] = []
-        open_positions: dict[str, dict] = {}  # symbol → position dict
+        open_positions: dict[str, dict] = {}
 
-        # ── 1. Pre-market scan using daily data ───────────────────────
-        # Strategy expects Fyers-format symbols and DataFrames
+        # ── 1. Pre-market scan ────────────────────────────────────────
         watchlist = self._strategy.pre_market_scan(
             list(data.keys()),
             data,
@@ -95,8 +82,6 @@ class BacktestEngine:
             watchlist = list(data.keys())
 
         # ── 2. Build unified candle timeline ──────────────────────────
-        # Convert all DataFrames to Candle objects and merge into a
-        # single timeline sorted by (timestamp, symbol).
         all_candles: list[Candle] = []
         candle_history: dict[str, list[Candle]] = {sym: [] for sym in watchlist}
 
@@ -107,7 +92,6 @@ class BacktestEngine:
 
             df = df.copy()
 
-            # Apply date filters
             if start_date and "timestamp" in df.columns:
                 start_dt = pd.Timestamp(start_date, tz=IST)
                 start_ms = int(start_dt.timestamp() * 1000)
@@ -130,13 +114,12 @@ class BacktestEngine:
                 )
                 all_candles.append(candle)
 
-        # Sort by timestamp, then symbol for deterministic ordering
         all_candles.sort(key=lambda c: (c.timestamp, c.symbol))
 
         if not all_candles:
             return self._empty_result(initial_capital, start_date, end_date, wall_start)
 
-        # ── 3. Track trading days for daily resets ────────────────────
+        # ── 3. Track trading days ─────────────────────────────────────
         current_day: str = ""
 
         # ── 4. Candle-by-candle simulation ────────────────────────────
@@ -146,24 +129,16 @@ class BacktestEngine:
             candle_dt = epoch_ms_to_ist(ts)
             day_str = candle_dt.strftime("%Y-%m-%d")
 
-            # ── Daily reset (new trading day) ─────────────────────────
+            # ── Daily reset ───────────────────────────────────────────
             if day_str != current_day:
-                # Force-flatten any overnight positions from previous day
                 for sym, pos in list(open_positions.items()):
                     trade = self._close_position(pos, pos["last_price"], ts, "FLATTEN")
                     all_trades.append(trade)
                     capital += trade["pnl_net"]
                 open_positions.clear()
 
-                # Reset strategy state for new day
                 self._strategy.end_of_day()
-
-                # Re-run pre_market_scan for new day
-                self._strategy.pre_market_scan(
-                    list(data.keys()),
-                    data,
-                )
-
+                self._strategy.pre_market_scan(list(data.keys()), data)
                 current_day = day_str
 
             # ── Update candle history ─────────────────────────────────
@@ -171,10 +146,9 @@ class BacktestEngine:
                 candle_history[symbol] = []
             candle_history[symbol].append(candle)
 
-            # ── Check exits first for open positions ──────────────────
+            # ── Check exits first ─────────────────────────────────────
             if symbol in open_positions:
                 pos = open_positions[symbol]
-                # Update peak price for trailing stop
                 if pos["direction"] == "LONG":
                     pos["peak_price"] = max(pos.get("peak_price", pos["entry_price"]), candle.high)
                 else:
@@ -185,9 +159,7 @@ class BacktestEngine:
 
                 if exit_signal.signal_type in (SignalType.EXIT_LONG, SignalType.EXIT_SHORT):
                     exit_reason = exit_signal.indicator_data.get("exit_reason", "UNKNOWN")
-                    
-                    # For STOPLOSS exits, use the SL price (not candle close)
-                    # to simulate limit/SL-M order execution
+
                     if exit_reason == "STOPLOSS":
                         sl_price = pos.get("stoploss_price", candle.close)
                         exit_price = self._apply_slippage(
@@ -211,7 +183,7 @@ class BacktestEngine:
                     equity_curve.append((ts, capital))
                     continue
 
-            # ── Check entries (only if no position in this symbol) ────
+            # ── Check entries ─────────────────────────────────────────
             if symbol not in open_positions:
                 current_pos = None
             else:
@@ -223,17 +195,25 @@ class BacktestEngine:
             )
 
             if entry_signal.signal_type in (SignalType.BUY, SignalType.SELL):
-                # ── Position sizing ───────────────────────────────────
                 stoploss = entry_signal.indicator_data.get("stoploss_price")
                 target = entry_signal.indicator_data.get("target_price")
 
                 if stoploss is None:
                     continue
 
+                direction = "LONG" if entry_signal.signal_type == SignalType.BUY else "SHORT"
+
+                # ── Entry price: use trigger_price if provided ────────
+                # The VMR strategy fires the signal at the trigger price
+                # (pin bar high + 1 tick), NOT candle.close
+                trigger = entry_signal.indicator_data.get("trigger_price")
+                if trigger and trigger > 0:
+                    base_entry = trigger
+                else:
+                    base_entry = candle.close
+
                 entry_price = self._apply_slippage(
-                    candle.close,
-                    "LONG" if entry_signal.signal_type == SignalType.BUY else "SHORT",
-                    is_exit=False,
+                    base_entry, direction, is_exit=False,
                 )
 
                 risk_per_share = abs(entry_price - stoploss)
@@ -244,34 +224,34 @@ class BacktestEngine:
                 if len(open_positions) >= settings.MAX_CONCURRENT_POSITIONS:
                     continue
 
-                # Capital check
-                # Use strategy-provided quantity if available (VMR uses fixed loss sizing)
+                # Use strategy-provided quantity if available
                 strategy_qty = entry_signal.indicator_data.get("quantity")
                 if strategy_qty and strategy_qty > 0:
                     quantity = strategy_qty
                 else:
-                    # Fallback: engine-level sizing
                     risk_budget = min(settings.RISK_PER_TRADE_INR, capital * 0.02)
                     quantity = int(risk_budget / risk_per_share)
-                
+
                 if quantity <= 0:
                     continue
 
-                # Check if we have enough capital for the position
+                # Capital sufficiency
                 position_value = entry_price * quantity
                 if position_value > capital:
                     quantity = int(capital / entry_price)
                     if quantity <= 0:
                         continue
 
-                # Cap position value at 20% of current capital
-                max_position_value = capital * 0.20
-                if position_value > max_position_value:
-                    quantity = int(max_position_value / entry_price)
-                    if quantity <= 0:
-                        continue
+                # Cap at 20% of current capital
+                # Capital sufficiency check only — no arbitrary cap.
+                # Strategy is responsible for its own position sizing.
+                # Just ensure we don't exceed available capital.
 
-                direction = "LONG" if entry_signal.signal_type == SignalType.BUY else "SHORT"
+                #max_position_value = capital * 0.20
+                #if position_value > max_position_value:
+                #    quantity = int(max_position_value / entry_price)
+                #    if quantity <= 0:
+                #        continue
 
                 open_positions[symbol] = {
                     "symbol": symbol,
@@ -286,8 +266,7 @@ class BacktestEngine:
                     "indicator_data": entry_signal.indicator_data,
                 }
 
-
-            # ── Record equity at each candle ──────────────────────────
+            # ── Record equity ─────────────────────────────────────────
             unrealised = 0.0
             for sym, pos in open_positions.items():
                 if pos["direction"] == "LONG":
@@ -297,7 +276,7 @@ class BacktestEngine:
 
             equity_curve.append((ts, capital + unrealised))
 
-        # ── 5. Force-flatten any remaining positions ──────────────────
+        # ── 5. Flatten remaining ──────────────────────────────────────
         last_ts = all_candles[-1].timestamp if all_candles else 0
         for sym, pos in list(open_positions.items()):
             trade = self._close_position(pos, pos["last_price"], last_ts, "FLATTEN")
@@ -308,7 +287,7 @@ class BacktestEngine:
         if equity_curve:
             equity_curve.append((last_ts, capital))
 
-        # ── 6. Compute performance metrics ────────────────────────────
+        # ── 6. Compute metrics ────────────────────────────────────────
         metrics = compute_metrics(all_trades, initial_capital, equity_curve)
 
         wall_end = time.time()
@@ -355,7 +334,6 @@ class BacktestEngine:
         else:
             gross_pnl = (entry_price - exit_price) * quantity
 
-        # Compute costs
         pnl_result = self._cost_model.compute_net_pnl(
             entry_price=entry_price,
             exit_price=exit_price,
@@ -387,27 +365,18 @@ class BacktestEngine:
         direction: str,
         is_exit: bool,
     ) -> float:
-        """
-        Apply slippage to simulate real fills.
-
-        Entry: unfavorable direction (LONG buys higher, SHORT sells lower).
-        Exit: unfavorable direction (LONG sells lower, SHORT buys higher).
-        """
+        """Apply slippage to simulate real fills."""
         slippage_pct = settings.SLIPPAGE_PCT / 100.0
 
         if direction == "LONG":
             if is_exit:
-                # Selling: worse fill = lower price
                 return round(price * (1.0 - slippage_pct), 2)
             else:
-                # Buying: worse fill = higher price
                 return round(price * (1.0 + slippage_pct), 2)
-        else:  # SHORT
+        else:
             if is_exit:
-                # Buying to cover: worse fill = higher price
                 return round(price * (1.0 + slippage_pct), 2)
             else:
-                # Selling short: worse fill = lower price
                 return round(price * (1.0 - slippage_pct), 2)
 
     def _empty_result(

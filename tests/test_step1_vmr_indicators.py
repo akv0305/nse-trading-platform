@@ -1,5 +1,6 @@
 """
 Tests for wick_rejection indicator module.
+Updated for v2.0 filters: ATR, nose-wick, prior micro-trend.
 """
 import pytest
 from dataclasses import dataclass
@@ -11,7 +12,7 @@ from typing import Optional
 @dataclass
 class _Candle:
     symbol: str
-    timestamp: int       # epoch ms (unused in indicator logic)
+    timestamp: int
     open: float
     high: float
     low: float
@@ -60,20 +61,55 @@ def _bands(vwap=1000.0, sd=10.0) -> VWAPBands:
 class TestDetectWickRejection:
     """Tests for the wick-rejection (pin bar) detection function."""
 
-    def _recent(self, n=12, base=1000.0, vol=50000):
-        """Generate N neutral candles for volume averaging."""
-        return [_c(base, base + 2, base - 2, base + 1, vol) for _ in range(n)]
+    def _recent_downtrend(self, n=12, start=1000.0, vol=50000):
+        """
+        Generate N candles with a clear downward drift.
+        Each candle closes ~1 point lower than the previous.
+        Ranges ~6 points each (for ATR ~6, so pin bars with range ≥6 pass).
+        """
+        candles = []
+        for i in range(n):
+            price = start - i * 1.0
+            candles.append(_c(
+                o=price + 0.5,
+                h=price + 3,
+                l=price - 3,
+                c=price,
+                vol=vol,
+            ))
+        return candles
+
+    def _recent_uptrend(self, n=12, start=1000.0, vol=50000):
+        """
+        Generate N candles with a clear upward drift.
+        Each candle closes ~1 point higher than the previous.
+        Ranges ~6 points each.
+        """
+        candles = []
+        for i in range(n):
+            price = start + i * 1.0
+            candles.append(_c(
+                o=price - 0.5,
+                h=price + 3,
+                l=price - 3,
+                c=price,
+                vol=vol,
+            ))
+        return candles
 
     # ── Bullish Hammer Tests ──────────────────────────────────────
 
     def test_bullish_hammer_at_lower_band(self):
-        """Classic hammer: long lower wick, body in upper third, at -1.5SD."""
+        """Classic hammer: long lower wick, body in upper third, at -1.5SD.
+        Nose wick must be ≤ 10% of candle range."""
         bands = _bands(vwap=1000.0, sd=10.0)  # lower_1_5sd = 985
-        # Hammer: open=984, high=986, low=978, close=985
-        # body = |985-984| = 1, lower wick = 984-978 = 6, ratio = 6/1 = 6
-        # body_mid = 984.5, body_pos = (984.5 - 978) / (986 - 978) = 0.8125 (upper third)
-        candle = _c(o=984, h=986, l=978, c=985, vol=80000)
-        recent = self._recent(vol=50000)
+        # Hammer: open=984, high=985.5, low=975, close=985
+        # body = 1, lower wick = 984-975 = 9, ratio = 9
+        # candle_range = 985.5-975 = 10.5
+        # nose (upper wick) = 985.5-985 = 0.5, nose_pct = 0.5/10.5 = 0.048 < 0.10 ✓
+        # body_mid = 984.5, body_pos = (984.5-975)/10.5 = 0.905 (upper third) ✓
+        candle = _c(o=984, h=985.5, l=975, c=985, vol=80000)
+        recent = self._recent_downtrend(n=12, start=995.0, vol=50000)
 
         wr = detect_wick_rejection(candle, bands, recent)
 
@@ -89,8 +125,11 @@ class TestDetectWickRejection:
     def test_bullish_hammer_at_2sd(self):
         """Hammer at -2.0SD should flag band_touch as -2.0SD."""
         bands = _bands(vwap=1000.0, sd=10.0)  # lower_2sd = 980
-        candle = _c(o=979, h=981, l=974, c=980, vol=70000)
-        recent = self._recent(vol=50000)
+        # Hammer: open=979, high=980, low=970, close=980
+        # body = 1, lower wick = 979-970 = 9, ratio = 9
+        # range = 980-970 = 10, nose = 980-980 = 0, nose_pct = 0 ✓
+        candle = _c(o=979, h=980, l=970, c=980, vol=70000)
+        recent = self._recent_downtrend(n=12, start=990.0, vol=50000)
 
         wr = detect_wick_rejection(candle, bands, recent)
 
@@ -100,8 +139,8 @@ class TestDetectWickRejection:
     def test_no_hammer_if_low_volume(self):
         """Hammer shape but volume below average → no signal."""
         bands = _bands(vwap=1000.0, sd=10.0)
-        candle = _c(o=984, h=986, l=978, c=985, vol=30000)  # below avg
-        recent = self._recent(vol=50000)
+        candle = _c(o=984, h=985, l=975, c=985, vol=30000)  # below avg
+        recent = self._recent_downtrend(n=12, start=995.0, vol=50000)
 
         wr = detect_wick_rejection(candle, bands, recent)
 
@@ -112,7 +151,7 @@ class TestDetectWickRejection:
         bands = _bands(vwap=1000.0, sd=10.0)
         # body = |985-983| = 2, lower wick = 983-982 = 1, ratio = 0.5
         candle = _c(o=983, h=986, l=982, c=985, vol=60000)
-        recent = self._recent(vol=50000)
+        recent = self._recent_downtrend(n=12, start=995.0, vol=50000)
 
         wr = detect_wick_rejection(candle, bands, recent)
 
@@ -121,9 +160,32 @@ class TestDetectWickRejection:
     def test_no_hammer_if_not_at_band(self):
         """Good hammer shape but price is near VWAP, not at -1.5SD."""
         bands = _bands(vwap=1000.0, sd=10.0)
-        # Low = 996, above lower_1_5sd (985) → not at band
-        candle = _c(o=997, h=999, l=991, c=998, vol=60000)
-        recent = self._recent(vol=50000)
+        # Low = 991, above lower_1_5sd (985) → not at band
+        candle = _c(o=997, h=998, l=991, c=998, vol=60000)
+        recent = self._recent_downtrend(n=12, start=1002.0, vol=50000)
+
+        wr = detect_wick_rejection(candle, bands, recent)
+
+        assert wr.rejection_type == RejectionType.NONE
+
+    def test_no_hammer_if_nose_too_large(self):
+        """Hammer shape but nose (upper wick) > 10% of range → no signal."""
+        bands = _bands(vwap=1000.0, sd=10.0)
+        # open=984, high=987, low=978, close=985
+        # range = 987-978 = 9, nose = 987-985 = 2, nose_pct = 2/9 = 0.222 > 0.10
+        candle = _c(o=984, h=987, l=978, c=985, vol=80000)
+        recent = self._recent_downtrend(n=12, start=995.0, vol=50000)
+
+        wr = detect_wick_rejection(candle, bands, recent)
+
+        assert wr.rejection_type == RejectionType.NONE
+
+    def test_no_hammer_if_no_prior_downtrend(self):
+        """Hammer at band but prior candles trending UP → no signal."""
+        bands = _bands(vwap=1000.0, sd=10.0)
+        candle = _c(o=984, h=985, l=975, c=985, vol=80000)
+        # Uptrend recent candles — wrong direction for bullish hammer
+        recent = self._recent_uptrend(n=12, start=980.0, vol=50000)
 
         wr = detect_wick_rejection(candle, bands, recent)
 
@@ -132,13 +194,15 @@ class TestDetectWickRejection:
     # ── Bearish Shooting Star Tests ───────────────────────────────
 
     def test_bearish_shooting_star_at_upper_band(self):
-        """Classic shooting star: long upper wick, body in lower third, at +1.5SD."""
+        """Classic shooting star: long upper wick, body in lower third, at +1.5SD.
+        Nose wick must be ≤ 10% of candle range."""
         bands = _bands(vwap=1000.0, sd=10.0)  # upper_1_5sd = 1015
-        # SS: open=1016, high=1022, low=1014, close=1015
-        # body = 1, upper wick = 1022-1016 = 6, ratio = 6
-        # body_mid = 1015.5, body_pos = (1015.5-1014)/(1022-1014) = 0.1875 (lower third)
-        candle = _c(o=1016, h=1022, l=1014, c=1015, vol=80000)
-        recent = self._recent(vol=50000)
+        # SS: open=1016, high=1025, low=1015, close=1015
+        # body = 1, upper wick = 1025-1016 = 9, ratio = 9
+        # range = 1025-1015 = 10, nose (lower wick) = 1015-1015 = 0, nose_pct = 0 ✓
+        # body_mid = 1015.5, body_pos = (1015.5-1015)/10 = 0.05 (lower third) ✓
+        candle = _c(o=1016, h=1025, l=1015, c=1015, vol=80000)
+        recent = self._recent_uptrend(n=12, start=1005.0, vol=50000)
 
         wr = detect_wick_rejection(candle, bands, recent)
 
@@ -153,8 +217,11 @@ class TestDetectWickRejection:
     def test_bearish_shooting_star_at_2sd(self):
         """Shooting star at +2.0SD should flag band_touch as +2.0SD."""
         bands = _bands(vwap=1000.0, sd=10.0)  # upper_2sd = 1020
-        candle = _c(o=1021, h=1027, l=1019, c=1020, vol=70000)
-        recent = self._recent(vol=50000)
+        # SS: open=1021, high=1030, low=1020, close=1020
+        # body = 1, upper wick = 1030-1021 = 9, ratio = 9
+        # range = 10, nose = 0 ✓
+        candle = _c(o=1021, h=1030, l=1020, c=1020, vol=70000)
+        recent = self._recent_uptrend(n=12, start=1010.0, vol=50000)
 
         wr = detect_wick_rejection(candle, bands, recent)
 
@@ -167,7 +234,30 @@ class TestDetectWickRejection:
         # body_mid = 1018, range = 1022-1014 = 8
         # body_pos = (1018-1014)/8 = 0.5 → not lower third
         candle = _c(o=1017, h=1022, l=1014, c=1019, vol=70000)
-        recent = self._recent(vol=50000)
+        recent = self._recent_uptrend(n=12, start=1005.0, vol=50000)
+
+        wr = detect_wick_rejection(candle, bands, recent)
+
+        assert wr.rejection_type == RejectionType.NONE
+
+    def test_no_shooting_star_if_nose_too_large(self):
+        """Shooting star shape but nose (lower wick) > 10% of range → no signal."""
+        bands = _bands(vwap=1000.0, sd=10.0)
+        # open=1016, high=1022, low=1013, close=1015
+        # range = 1022-1013 = 9, nose = min(1016,1015)-1013 = 2, nose_pct = 2/9 = 0.222
+        candle = _c(o=1016, h=1022, l=1013, c=1015, vol=80000)
+        recent = self._recent_uptrend(n=12, start=1005.0, vol=50000)
+
+        wr = detect_wick_rejection(candle, bands, recent)
+
+        assert wr.rejection_type == RejectionType.NONE
+
+    def test_no_shooting_star_if_no_prior_uptrend(self):
+        """Shooting star at band but prior candles trending DOWN → no signal."""
+        bands = _bands(vwap=1000.0, sd=10.0)
+        candle = _c(o=1016, h=1025, l=1015, c=1015, vol=80000)
+        # Downtrend recent candles — wrong direction for bearish star
+        recent = self._recent_downtrend(n=12, start=1020.0, vol=50000)
 
         wr = detect_wick_rejection(candle, bands, recent)
 
@@ -182,17 +272,33 @@ class TestDetectWickRejection:
         wr = detect_wick_rejection(candle, bands, [])
         assert wr.rejection_type == RejectionType.NONE
 
+    def test_candle_below_atr_rejected(self):
+        """A tiny candle whose range is below ATR of recent candles → NONE."""
+        bands = _bands(vwap=1000.0, sd=10.0)
+        # Recent candles have range ~6 each → ATR ≈ 6
+        recent = self._recent_downtrend(n=12, start=995.0, vol=50000)
+        # Tiny candle: range = 2, well below ATR of 6
+        candle = _c(o=984, h=985, l=983, c=985, vol=80000)
+
+        wr = detect_wick_rejection(candle, bands, recent)
+
+        assert wr.rejection_type == RejectionType.NONE
+
     def test_score_higher_for_stronger_signal(self):
         """Signal at -2SD with 3× volume should score higher than -1.5SD with 1.1× volume."""
         bands = _bands(vwap=1000.0, sd=10.0)
-        recent = self._recent(vol=50000)
+        recent = self._recent_downtrend(n=12, start=995.0, vol=50000)
 
-        # Strong signal
-        strong = _c(o=979, h=981, l=970, c=980, vol=150000)
+        # Strong signal: deeper at -2SD, high volume, clean shape
+        # open=979, high=980, low=968, close=980
+        # body=1, lower wick=979-968=11, range=12, nose=0
+        strong = _c(o=979, h=980, l=968, c=980, vol=150000)
         wr_strong = detect_wick_rejection(strong, bands, recent)
 
-        # Weak signal
-        weak = _c(o=984, h=986, l=978, c=985, vol=55000)
+        # Weak signal: at -1.5SD, barely above volume threshold
+        # open=984, high=985, low=975, close=985
+        # body=1, lower wick=984-975=9, range=10, nose=0
+        weak = _c(o=984, h=985, l=975, c=985, vol=55000)
         wr_weak = detect_wick_rejection(weak, bands, recent)
 
         assert wr_strong.rejection_type == RejectionType.BULLISH_HAMMER
@@ -213,7 +319,6 @@ class TestFormationStop:
 
         stop = compute_formation_stop(prior, pin, direction="LONG")
 
-        # Lowest low = 95 (pin bar), stop = 95 - 2*0.05 = 94.90
         assert stop == 94.90
 
     def test_short_stop_uses_highest_high_plus_2_ticks(self):
@@ -222,20 +327,18 @@ class TestFormationStop:
 
         stop = compute_formation_stop(prior, pin, direction="SHORT")
 
-        # Highest high = 110 (pin bar), stop = 110 + 2*0.05 = 110.10
         assert stop == 110.10
 
     def test_lookback_limits_candles(self):
         """With lookback=1, only last 1 prior candle + pin bar used."""
         prior = [
-            _c(100, 105, 90, 102),   # very low = 90, but outside lookback
-            _c(100, 103, 97, 101),   # this one is within lookback=1
+            _c(100, 105, 90, 102),
+            _c(100, 103, 97, 101),
         ]
         pin = _c(98, 101, 95, 100)
 
         stop = compute_formation_stop(prior, pin, direction="LONG", lookback=1)
 
-        # Only prior[-1] (low=97) and pin (low=95); lowest=95; stop=94.90
         assert stop == 94.90
 
     def test_empty_recent_candles(self):
@@ -244,7 +347,6 @@ class TestFormationStop:
 
         stop = compute_formation_stop([], pin, direction="LONG")
 
-        # Only pin (low=93); stop = 93 - 0.10 = 92.90
         assert stop == 92.90
 
 
@@ -260,11 +362,9 @@ class TestComputeVWAPBands:
         bands = compute_vwap_bands(candles)
 
         assert bands is not None
-        # TP = (102+98+101)/3 = 100.333..., VWAP = same (single candle)
         assert abs(bands.vwap - 100.33) < 0.1
-        # SD = 0 for single candle
         assert bands.std_dev == 0.0
-        assert bands.upper_1_5sd == bands.vwap  # 0 SD → bands collapse
+        assert bands.upper_1_5sd == bands.vwap
 
     def test_multiple_candles_bands_widen(self):
         candles = [
